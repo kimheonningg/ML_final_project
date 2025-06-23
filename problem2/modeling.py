@@ -79,57 +79,110 @@ def load_model() -> torch.nn.Module:
     #
     ############################################################################################
     import math
-    class PositionalEncoding(torch.nn.Module):
-        def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+    import numpy as np
+    class FourierLayer(torch.nn.Module):
+        def __init__(self, pred_len, k_seasonal):
             super().__init__()
-            self.dropout = torch.nn.Dropout(p=dropout)
-            pe = torch.zeros(max_len, d_model)
-            position = torch.arange(0, max_len).unsqueeze(1)
-            div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-            pe[:, 0::2] = torch.sin(position * div_term)
-            pe[:, 1::2] = torch.cos(position * div_term)
-            pe = pe.unsqueeze(0)
-            self.register_buffer("pe", pe)
+            self.pred_len = pred_len
+            self.k = k_seasonal
+            frequencies = torch.arange(1, k_seasonal + 1, dtype=torch.float32)
+            self.register_buffer('frequencies', frequencies)
 
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            x = x + self.pe[:, :x.size(1), :]
+        def forward(self, seq_len):
+            t = torch.arange(seq_len, dtype=torch.float32).to(self.frequencies.device)
+            args = 2 * np.pi * self.frequencies[:, None] * t[None, :] / seq_len
+            s_t = torch.sin(args)
+            c_t = torch.cos(args)
+            return torch.cat([s_t, c_t], dim=0).T
+
+    class ETSLayer(torch.nn.Module):
+        def __init__(self, d_model, seq_len, k_seasonal, dropout=0.1):
+            super().__init__()
+            self.d_model = d_model
+            self.seq_len = seq_len
+            self.k = k_seasonal
+            
+            self.alpha = torch.nn.Parameter(torch.rand(1))
+            self.smooth = torch.nn.Sequential(
+                torch.nn.Linear(d_model, d_model),
+                torch.nn.ReLU(),
+                torch.nn.Linear(d_model, d_model)
+            )
+
+            self.beta = torch.nn.Parameter(torch.rand(1))
+            self.growth = torch.nn.Linear(d_model, d_model)
+            
+            self.gamma = torch.nn.Parameter(torch.rand(1))
+            self.fourier = FourierLayer(pred_len=seq_len, k_seasonal=k_seasonal)
+            self.seasonal = torch.nn.Linear(2 * k_seasonal, d_model)
+
+            self.dropout = torch.nn.Dropout(dropout)
+        
+        def forward(self, x):
+            smooth_x = self.smooth(x)
+            
+            growth_x = self.growth(x)
+            
+            fourier_terms = self.fourier(self.seq_len)
+            seasonal_x = self.seasonal(fourier_terms)
+            
+            x = self.alpha * smooth_x + \
+                self.beta * growth_x + \
+                self.gamma * seasonal_x[None, :, :] + \
+                (1 - self.alpha - self.beta - self.gamma) * x
+            
             return self.dropout(x)
 
-    class TransformerModel(torch.nn.Module):
-        def __init__(self, input_features: int, d_model: int, nhead: int, d_hid: int, nlayers: int, dropout: float = 0.2):
+    class ETSformer(torch.nn.Module):
+        def __init__(self, input_features, seq_len, d_model, n_layers, k_seasonal, dropout):
             super().__init__()
-            self.model_type = 'Transformer'
-            self.d_model = d_model
-            self.encoder = torch.nn.Linear(input_features, d_model)
-            self.pos_encoder = PositionalEncoding(d_model, dropout)
-            encoder_layers = torch.nn.TransformerEncoderLayer(d_model, nhead, d_hid, dropout, batch_first=True)
-            self.transformer_encoder = torch.nn.TransformerEncoder(encoder_layers, nlayers)
-            self.decoder = torch.nn.Linear(d_model, 1)
-            self.init_weights()
+            self.embedding = torch.nn.Linear(input_features, d_model)
+            self.layers = torch.nn.ModuleList(
+                [ETSLayer(d_model, seq_len, k_seasonal, dropout) for _ in range(n_layers)]
+            )
+            self.flatten = torch.nn.Flatten(start_dim=1)
+            self.decoder = torch.nn.Linear(seq_len * d_model, 1)
 
-        def init_weights(self) -> None:
-            initrange = 0.1
-            self.encoder.weight.data.uniform_(-initrange, initrange)
-
-        def forward(self, src: torch.Tensor) -> torch.Tensor:
-            if src.dim() == 2:
-                src = src.unsqueeze(1)
-            src = self.encoder(src) * math.sqrt(self.d_model)
-            src = self.pos_encoder(src)
-            output = self.transformer_encoder(src)
-            output = output.squeeze(1)
+        def forward(self, x):
+            x = self.embedding(x)
+            
+            for layer in self.layers:
+                x = layer(x)
+                
+            output = self.flatten(x)
             output = self.decoder(output)
             return output
 
+    class ETSformerWrapper(torch.nn.Module):
+        def __init__(self, actual_model: torch.nn.Module, seq_len: int):
+            super().__init__()
+            self.actual_model = actual_model
+            self.seq_len = seq_len
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x = x.unsqueeze(1)
+            x = x.repeat(1, self.seq_len, 1)
+            return self.actual_model(x)
+
     INPUT_FEATURES = 16
-    D_MODEL = 128
-    N_HEAD = 8
-    D_HID = 256
-    N_LAYERS = 3
-    DROPOUT = 0.2
-    model = TransformerModel(input_features=INPUT_FEATURES, d_model=D_MODEL, nhead=N_HEAD, d_hid=D_HID, nlayers=N_LAYERS, dropout=DROPOUT)
+    SEQ_LEN = 100
     
-    # TODO: implement your own model after removing this line
+    K_SEASONAL = 10 
+    
+    D_MODEL = 64
+    N_LAYERS = 2
+    DROPOUT = 0.1
+
+    etsformer_model = ETSformer(
+        input_features=INPUT_FEATURES,
+        seq_len=SEQ_LEN,
+        d_model=D_MODEL,
+        n_layers=N_LAYERS,
+        k_seasonal=K_SEASONAL,
+        dropout=DROPOUT
+    )
+    
+    model = ETSformerWrapper(actual_model=etsformer_model, seq_len=SEQ_LEN)
     ############################################################################################
     assert isinstance(model, torch.nn.Module), "model must be a torch.nn.Module"
     return model
@@ -159,7 +212,7 @@ def load_optimizer(model: torch.nn.Module) -> torch.optim.Optimizer:
     #                   Feel free to modify the code below.
     #
     ############################################################################################
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
     
     return optimizer
 
@@ -186,8 +239,8 @@ def load_scheduler(
     #                   Feel free to modify the code below.
     #
     ############################################################################################
-    epochs = 50
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    epochs = 20
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-4)
     return scheduler
 
 
@@ -263,8 +316,8 @@ def train(
     device = device or get_device()
     model.to(device=device)
 
-    epochs = 30
-    patience = 7
+    epochs = 20
+    patience = 20
 
     best_val_loss = float('inf')
     patience_counter = 0
@@ -274,11 +327,13 @@ def train(
     for epoch_i in range(epochs):
         model.train()
         running_train_loss = 0.0
+        num_batches = len(train_loader)
+        
         for batch_i, (x, y) in enumerate(train_loader):
-            x, y = x.to(device), y.to(device)
+            if (batch_i + 1) % 50 == 0:
+                print(f"  Epoch {epoch_i+1}/{epochs} | Processing batch {batch_i+1}/{num_batches}")
 
-            if x.dim() == 2:
-                x = x.unsqueeze(1) 
+            x, y = x.to(device), y.to(device)
 
             pred_y = model(x)
             loss = torch.nn.functional.mse_loss(pred_y.squeeze(), y.squeeze())
@@ -297,10 +352,6 @@ def train(
         with torch.no_grad():
             for x, y in val_loader:
                 x, y = x.to(device), y.to(device)
-
-                if x.dim() == 2:
-                    x = x.unsqueeze(1)
-
                 pred_y = model(x)
                 loss = torch.nn.functional.mse_loss(pred_y.squeeze(), y.squeeze())
                 running_val_loss += loss.item()
@@ -321,10 +372,9 @@ def train(
             print(f"  -> Found new best model with Val Loss: {best_val_loss:.4f}")
         else:
             patience_counter += 1
-            print(f"  -> Val Loss did not improve. Patience: {patience_counter}/{patience}")
 
         if patience_counter >= patience:
-            print("\n--- Early stopping triggered ---")
+            print(f"\n--- Early stopping triggered after {patience} epochs with no improvement. ---")
             break
 
     if best_model_state:
