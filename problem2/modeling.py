@@ -23,7 +23,7 @@ class PandasDataset(Dataset):
         return len(self.df)
 
     def __getitem__(self, idx):
-        x = self.df.iloc[idx].drop(columns=[self.y_col]).to_numpy()
+        x = self.df.iloc[idx].drop(labels=[self.y_col]).to_numpy()
         y = self.df.iloc[idx][self.y_col]
         return torch.tensor(x, dtype=torch.float32), torch.tensor(
             y, dtype=torch.float32
@@ -164,7 +164,7 @@ def load_model() -> torch.nn.Module:
             x = x.repeat(1, self.seq_len, 1)
             return self.actual_model(x)
 
-    INPUT_FEATURES = 16
+    INPUT_FEATURES = 15
     SEQ_LEN = 100
     
     K_SEASONAL = 10 
